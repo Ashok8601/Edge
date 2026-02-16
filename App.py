@@ -1,50 +1,142 @@
 from flask import Flask, request, jsonify, send_file
-import asyncio, edge_tts, os, uuid
 from flask_cors import CORS
+import asyncio
+import edge_tts
+import os
+import uuid
 
 app = Flask(__name__)
-CORS(app)  # Postman / any frontend se call karne ke liye
+CORS(app)
 
-# Available voices
-VOICES = {
-    "English-US": ["en-US-GuyNeural", "en-US-JennyNeural"],
-    "English-GB": ["en-GB-RyanNeural", "en-GB-SoniaNeural"],
-    "Hindi": ["hi-IN-PrabhatNeural", "hi-IN-SwaraNeural"]
+# ===============================
+# CHARACTER → VOICE MAP
+# ===============================
+
+CHARACTER_VOICES = {
+    "RAVI": "en-US-GuyNeural",
+    "PRIYA": "en-US-JennyNeural",
+    "NARRATOR": "en-GB-RyanNeural",
+    "HINDI_BOY": "hi-IN-PrabhatNeural",
+    "HINDI_GIRL": "hi-IN-SwaraNeural"
 }
+
+# ===============================
+# ASYNC TTS GENERATOR
+# ===============================
 
 async def generate_tts(text, voice, output_file):
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(output_file)
 
-@app.route("/tts", methods=["POST"])
-def tts():
+# ===============================
+# SCRIPT PARSER
+# ===============================
+
+def parse_script(script):
+    lines = script.strip().split("\n")
+    dialogues = []
+
+    for line in lines:
+        if ":" in line:
+            character, text = line.split(":", 1)
+            character = character.strip().upper()
+            text = text.strip()
+
+            voice = CHARACTER_VOICES.get(character)
+
+            if voice:
+                dialogues.append({
+                    "voice": voice,
+                    "text": text
+                })
+
+    return dialogues
+
+# ===============================
+# MERGE AUDIO USING FFMPEG
+# ===============================
+
+def merge_audio_files(audio_files, output_file):
+    filelist_path = "filelist.txt"
+
+    with open(filelist_path, "w") as f:
+        for file in audio_files:
+            f.write(f"file '{os.path.abspath(file)}'\n")
+
+    os.system(f"ffmpeg -f concat -safe 0 -i {filelist_path} -c copy {output_file}")
+
+    os.remove(filelist_path)
+
+# ===============================
+# AUDIOBOOK ENDPOINT
+# ===============================
+
+@app.route("/audiobook", methods=["POST"])
+def audiobook():
     data = request.get_json()
-    text = data.get("text")
-    voice = data.get("voice")
+    script = data.get("script")
 
-    if not text or not voice:
-        return jsonify({"error": "Text and voice required!"}), 400
+    if not script:
+        return jsonify({"error": "Script is required"}), 400
 
-    output_file = f"tts_{uuid.uuid4().hex}.mp3"
+    dialogues = parse_script(script)
+
+    if not dialogues:
+        return jsonify({"error": "No valid character lines found"}), 400
+
+    session_id = uuid.uuid4().hex
+    final_file = f"audiobook_{session_id}.mp3"
+
     try:
-        asyncio.run(generate_tts(text, voice, output_file))
+        async def generate_full():
+            with open(final_file, "wb") as f:
+                for dialogue in dialogues:
+                    communicate = edge_tts.Communicate(
+                        dialogue["text"],
+                        dialogue["voice"]
+                    )
+                    async for chunk in communicate.stream():
+                        if chunk["type"] == "audio":
+                            f.write(chunk["data"])
+
+        asyncio.run(generate_full())
+
+        # IMPORTANT: Check file exists
+        if not os.path.exists(final_file):
+            return jsonify({"error": "File generation failed"}), 500
+
+        return jsonify({
+            "message": "Audiobook generated successfully",
+            "file": final_file,
+            "download_url": f"/download/{final_file}"
+        })
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-    return jsonify({"file": output_file})
+# ===============================
+# DOWNLOAD ENDPOINT
+# ===============================
 
 @app.route("/download/<filename>")
 def download(filename):
     file_path = os.path.join(os.getcwd(), filename)
+
     if os.path.exists(file_path):
         return send_file(file_path, as_attachment=True)
+
     return jsonify({"error": "File not found"}), 404
 
-@app.route("/voices")
-def voices():
-    return jsonify(VOICES)
+# ===============================
+# CHARACTER LIST ENDPOINT
+# ===============================
 
-import os
+@app.route("/characters")
+def characters():
+    return jsonify(CHARACTER_VOICES)
+
+# ===============================
+# MAIN
+# ===============================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
